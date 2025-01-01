@@ -1,118 +1,102 @@
 import socket
+import struct
 import hashlib
 import os
-import threading
+import time
 
-SERVER_ADDRESS = ('127.0.0.1', 12345)  
-CHUNK_SIZE = 1024                      
-TIMEOUT = 2                            
+# Constants
+SERVER_IP = '127.0.0.1'
+SERVER_PORT = 9000
+CHUNK_SIZE = 1024  # Size of each chunk in bytes
+OUTPUT_DIR = "downloads"  # Directory to save downloaded files
+
+# Ensure the output directory exists
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def calculate_checksum(data):
-
-    # Tính checksum cho dữ liệu.
+    """Calculate a simple checksum for the given data."""
     return hashlib.md5(data).hexdigest()
 
-def parse_packet(packet):
+def request_file_list(client_socket):
+    """Request and display the list of available files from the server."""
+    client_socket.sendto(b"LIST", (SERVER_IP, SERVER_PORT))
+    file_list, _ = client_socket.recvfrom(4096)
+    print("Available files:")
+    for line in file_list.decode().splitlines():
+        file_name = line.split()[0]  # Extract only the file name, ignore size
+        print(file_name)
 
-    # Phân tích gói tin nhận được từ server.
-    try:
-        header, payload = packet.split(b'|', 2)
-        seq_num, checksum = header.decode().split('|')
-        return int(seq_num), checksum, payload
-    except Exception as e:
-        print(f"Error parsing packet: {e}")
-        return None, None, None
+def download_file(client_socket, file_name):
+    """Download a file from the server in chunks."""
+    output_file = os.path.join(OUTPUT_DIR, file_name)
 
-def request_file_chunk(sock, file_name, chunk_id):
+    with open(output_file, 'wb') as f:
+        offset = 0
+        while True:
+            # Send download request for the current chunk
+            command = f"DOWNLOAD {file_name} {offset}"
+            client_socket.sendto(command.encode(), (SERVER_IP, SERVER_PORT))
 
-    # Yêu cầu tải một chunk từ server.
-    request = f"DOWNLOAD {file_name} {chunk_id}".encode()
-    sock.sendto(request, SERVER_ADDRESS)
+            # Receive the chunk from the server
+            packet, _ = client_socket.recvfrom(4096)
 
-def reliable_receive(sock, expected_seq):
+            # Kiểm tra độ dài gói tin
+            if len(packet) < 36:
+                print(f"Error: received packet is too small ({len(packet)} bytes).")
+                break
 
-    # Nhận dữ liệu tin cậy từ server.Kiểm tra thứ tự gói tin và checksum.
-    while True:
-        try:
-            sock.settimeout(TIMEOUT)
-            data, addr = sock.recvfrom(CHUNK_SIZE + 50)  # Dự phòng cho header
-            seq_num, checksum, payload = parse_packet(data)
+            # Unpack the packet to get sequence_number and checksum
+            sequence_number, checksum = struct.unpack("!I32s", packet[:36])
 
-            # Kiểm tra thứ tự gói tin và checksum
-            if seq_num == expected_seq and checksum == calculate_checksum(payload):
-                # Gửi ACK cho server
-                ack = f"ACK {seq_num}".encode()
-                sock.sendto(ack, addr)
-                return payload
-            else:
-                # Gửi NACK nếu gói tin sai
-                nack = f"NACK {expected_seq}".encode()
-                sock.sendto(nack, addr)
-        except socket.timeout:
-            # Timeout, gửi lại NACK
-            nack = f"NACK {expected_seq}".encode()
-            sock.sendto(nack, SERVER_ADDRESS)
+            # Extract the chunk data (phần còn lại sau checksum)
+            chunk_data = packet[36:]
 
-def download_chunk(file_name, chunk_id, chunk_size, output_file):
+            # Verify the checksum
+            received_checksum = checksum.decode()
+            if calculate_checksum(chunk_data) != received_checksum:
+                print(f"Checksum mismatch for chunk {sequence_number}. Retrying...")
+                continue
 
-    # Tải một chunk của file và lưu vào output_file.
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    request_file_chunk(sock, file_name, chunk_id)
+            # Write the chunk to the file
+            f.write(chunk_data)
+            print(f"Downloaded chunk {sequence_number}")
 
-    received_bytes = 0
-    with open(output_file, 'r+b') as f:
-        f.seek(chunk_id * chunk_size)
-        expected_seq = 0
+            # Check if the chunk size is less than the CHUNK_SIZE (indicating EOF)
+            if len(chunk_data) < CHUNK_SIZE:
+                print("File download complete.")
+                break
 
-        while received_bytes < chunk_size:
-            payload = reliable_receive(sock, expected_seq)
-            f.write(payload)
-            received_bytes += len(payload)
-            expected_seq += 1
-
-    sock.close()
-
-def read_input_file(file_name):
-    file_list = []
-    chunk_sizes = []
-    try:
-        with open(file_name, 'r') as f:
-            for line in f:
-                if line.strip():  # Bỏ qua dòng trống
-                    parts = line.split()
-                    file_name = parts[0]  # Tên file
-                    size_in_mb = int(parts[1].replace('MB', ''))  # Dung lượng file
-                    file_list.append(file_name)
-                    chunk_sizes.append(size_in_mb * 1024 * 1024)  # Chuyển MB -> Byte
-    except Exception as e:
-        print(f"Error reading file input.txt: {e}")
-    return file_list, chunk_sizes
+            # Update offset for next chunk
+            offset += CHUNK_SIZE
 
 def main():
-    input_file = "input.txt"
-    file_list, chunk_sizes = read_input_file(input_file)
-    num_chunks = 4  # Số phần chia file
+    # Initialize client
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client_socket.settimeout(5)  # Set timeout for responses
 
-    for file_name, total_size in zip(file_list, chunk_sizes):
-        print(f"Downloading {file_name}...")
-        chunk_size = total_size // num_chunks
-        output_file = os.path.join(os.getcwd(), file_name)
+    try:
+        while True:
+            print("\nOptions:")
+            print("1. List available files")
+            print("2. Download a file")
+            print("3. Exit")
+            choice = input("Enter your choice: ")
 
-        # Tạo file rỗng
-        with open(output_file, 'wb') as f:
-            f.truncate(total_size)
+            if choice == "1":
+                request_file_list(client_socket)
+            elif choice == "2":
+                file_name = input("Enter the name of the file to download: ")
+                download_file(client_socket, file_name)
+            elif choice == "3":
+                print("Exiting...")
+                break
+            else:
+                print("Invalid choice. Please try again.")
 
-        threads = []
-        for chunk_id in range(num_chunks):
-            thread = threading.Thread(target=download_chunk, args=(file_name, chunk_id, chunk_size, output_file))
-            threads.append(thread)
-            thread.start()
-
-        # Chờ tất cả các thread hoàn thành
-        for thread in threads:
-            thread.join()
-
-        print(f"{file_name} downloaded successfully.")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        client_socket.close()
 
 if __name__ == "__main__":
     main()
