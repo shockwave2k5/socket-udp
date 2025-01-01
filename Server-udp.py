@@ -1,70 +1,142 @@
 import socket
 import os
-import struct
 import hashlib
+import time
 
-# Constants
-CHUNK_SIZE = 1024  # Size of each chunk in bytes
-SERVER_IP = '127.0.0.1'
-SERVER_PORT = 9000
-FILE_LIST = "file_list.txt"  # File containing list of available files
-SERVERFILES_DIR = "Serverfiles"  # Thư mục chứa các tệp tin zip
+PORT = socket.gethostbyname(socket.gethostname())
+SERVER_ADDRESS = (PORT, 12345)
+CHUNK_SIZE = 1024  # Kích thước mỗi gói tin
+TIMEOUT = 2        # Timeout khi chờ ACK từ client
+
+FILES_PATH = os.path.join(os.getcwd(), "Files")
+
+def getSize(file):
+    filepath = os.path.join(FILES_PATH, file)
+    file_size = os.path.getsize(filepath)
+    return file_size
+
+def send_list_file(server_socket,client_socket):
+    try:
+        msg = ""
+        with open("server_files.txt", 'r') as file:
+            file_list = file.read()
+            line = file_list.split("\n")
+            for i in line:
+                print(i)
+                t = i.split(" ")
+                t[1] = str(getSize(t[0]))
+                msg = msg + t[0] + " " + t[1] + "\n"
+            print(msg)
+        server_socket.sendto(msg.encode(),client_socket)
+        print("Send list file successfully")
+    except Exception as e:
+        print(f"Error: {e}")
 
 def calculate_checksum(data):
-    """Calculate a simple checksum for the given data."""
+    # Tính checksum (MD5) cho dữ liệu.
     return hashlib.md5(data).hexdigest()
 
-def send_chunk(server_socket, client_address, file_name, offset):
-    """Send a chunk of the file to the client."""
-    try:
-        with open(os.path.join(SERVERFILES_DIR, file_name), 'rb') as file:
-            file.seek(offset)
-            chunk = file.read(CHUNK_SIZE)
-            checksum = calculate_checksum(chunk)
-            sequence_number = offset // CHUNK_SIZE
-            # Create packet: [sequence_number|checksum|chunk_data]
-            packet = struct.pack(f"!I32s{len(chunk)}s", sequence_number, checksum.encode(), chunk)
-            server_socket.sendto(packet, client_address)
-    except Exception as e:
-        print(f"Error sending chunk: {e}")
+def create_packet(seq_num, payload):
+    # Tạo gói tin gồm: seq_num|checksum|payload
+    checksum = calculate_checksum(payload)
+    header = f"{seq_num}|{checksum}".encode()
+    return header + b"\r\n\r\n" + payload
 
-def main():
-    # Initialize server
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server_socket.bind((SERVER_IP, SERVER_PORT))
-    print(f"Server listening on {SERVER_IP}:{SERVER_PORT}")
+def send_file_chunk(sock,client_addr, file_path, start, chunk_size,sent_bytes,seq_num,last_send,chunk_id):
+    # Gửi một chunk của file đến client.
+    with open(file_path, 'rb') as file:
+        file.seek(start[chunk_id])
 
+        if sent_bytes[chunk_id] < chunk_size:
+            # Đọc dữ liệu gói tin
+            payload = file.read(min(CHUNK_SIZE, chunk_size - sent_bytes[chunk_id]))
+            if not payload:
+                return
+            last_send[chunk_id] = len(payload)
+            # Tạo gói tin
+            packet = create_packet(seq_num[chunk_id], payload)
+            sock.sendto(packet, client_addr)
+            
+
+            
+
+def handle_client(sock):
+    # Xử lý yêu cầu từ client.
+    seq_num = [0,0,0,0]
+    start = [0,0,0,0]
+    sent_bytes = [0,0,0,0]
+    last_send = [0,0,0,0]
+    size = [0,0,0,0]
+    end = 0
     while True:
         try:
-            # Receive request from client
-            data, client_address = server_socket.recvfrom(1024)
-            command = data.decode().strip()
+            # Nhận yêu cầu từ client
+            data, client_addr = sock.recvfrom(1024)
+            request = data.decode().split()
+            command = request[0]
 
-            if command == "LIST":
-                # Send list of files
-                if os.path.exists(FILE_LIST):
-                    with open(FILE_LIST, 'r') as f:
-                        file_data = f.read().encode()
-                        server_socket.sendto(file_data, client_address)
+            if command == "DOWNLOAD":
+                file_name = request[1]
+                chunk_id = int(request[2])
+                file_path = os.path.join(FILES_PATH, file_name)
+
+                if not os.path.exists(file_path):
+                    print(f"File {file_name} does not exist.")
+                    sock.sendto(b"ERROR", client_addr)
+                    continue
+
+                # Tính toán vị trí chunk
+                file_size = os.path.getsize(file_path)
+                chunk_size = file_size // 4
+                start[chunk_id] = chunk_id * chunk_size
+                end = start[chunk_id] + chunk_size - 1 if chunk_id < 3 else file_size - 1
+                size[chunk_id] = end - start[chunk_id] + 1
+
+                print(f"Sending chunk {chunk_id} of {file_name} to {client_addr}...")
+                send_file_chunk(sock, client_addr, file_path, start, size[chunk_id],sent_bytes,seq_num,last_send,chunk_id)
+            elif command == "SENDLIST":
+                send_list_file(sock,client_addr)
+            elif command == "NACK":
+                chunk_id = int(request[2])
+                seq = int(request[1])
+                send_file_chunk(sock, client_addr, file_path, start, size[chunk_id] + 1,sent_bytes,seq_num,last_send,chunk_id)
+            elif command == "ACK":
+                chunk_id = int(request[2])
+                seq = int(request[1])
+                if seq == seq_num[chunk_id]:
+                    seq_num[chunk_id] += 1
+                    sent_bytes[chunk_id] += last_send[chunk_id]
+                    start[chunk_id] += last_send[chunk_id]
+                    send_file_chunk(sock, client_addr, file_path, start, size[chunk_id] + 1,sent_bytes,seq_num,last_send,chunk_id)
                 else:
-                    server_socket.sendto(b"ERROR: File list not found", client_address)
+                    send_file_chunk(sock, client_addr, file_path, start, size[chunk_id] + 1,sent_bytes,seq_num,last_send,chunk_id)
+            elif command != "NACK" and command != "ACK":
+                print(f"Invalid command from {client_addr}: {request}")
+            if sum(sent_bytes) >= sum(size):
+                seq_num[:] = [0] * len(seq_num)
+                start[:] = [0] * len(start)
+                sent_bytes[:] = [0] * len(sent_bytes)
+                last_send[:] = [0] * len(last_send)
+                size[:] = [0] * len(size)
+        except socket.timeout:
+            continue
+        
+         
 
-            elif command.startswith("DOWNLOAD"):
-                _, file_name, offset = command.split()
-                offset = int(offset)
+def main():
+    os.makedirs(FILES_PATH, exist_ok=True)
 
-                if os.path.exists(os.path.join(SERVERFILES_DIR, file_name)):
-                    send_chunk(server_socket, client_address, file_name, offset)
-                else:
-                    server_socket.sendto(b"ERROR: File not found", client_address)
+    # Tạo socket UDP
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server_socket.bind(SERVER_ADDRESS)
+    print(f"Server is running on {SERVER_ADDRESS}...")
 
-        except KeyboardInterrupt:
-            print("Server shutting down...")
-            break
-        except Exception as e:
-            print(f"Error: {e}")
-
-    server_socket.close()
+    try:
+        handle_client(server_socket)
+    except KeyboardInterrupt:
+        print("Server is shutting down.")
+    finally:
+        server_socket.close()
 
 if __name__ == "__main__":
     main()
