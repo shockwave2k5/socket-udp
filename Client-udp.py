@@ -10,7 +10,6 @@ PORT = int(input("Nhap port: "))
 SERVER_ADDRESS = (HOST,PORT)  
 CHUNK_SIZE = 1024                      
 TIMEOUT = 2                            
-close_flag = False
 barrier = threading.Barrier(4)
 file_list = []
 
@@ -75,21 +74,25 @@ def reliable_receive(sock, expected_seq,chunk_id):
             nack = f"NACK {expected_seq} {chunk_id}".encode()
             sock.sendto(nack, SERVER_ADDRESS)
 
-def download_chunk(sock,file_name, chunk_id, chunk_size, output_file):
+def download_chunk(sock,file_name, chunk_id, chunk_size, output_file,received_bytes):
 
     # Tải một chunk của file và lưu vào output_file.
 
     request_file_chunk(sock, file_name, chunk_id)
-    received_bytes = 0
     with open(output_file, 'r+b') as f:
         f.seek(chunk_id * chunk_size)
         expected_seq = 0
-        while received_bytes < chunk_size:
+        while received_bytes[chunk_id] < chunk_size:
             payload = reliable_receive(sock, expected_seq,chunk_id)
             f.write(payload)
-            received_bytes += len(payload)
+            received_bytes[chunk_id] += len(payload)
             expected_seq += 1
-        print(chunk_id)
+            #tim socket tai cham nhat
+            mn = min(received_bytes)
+            min_id = received_bytes.index(mn)
+            #xuat ra man hinh qua trinh tai
+            if chunk_id == min_id:
+                printProgress(file_name,False,received_bytes,chunk_size)
     barrier.wait() #Đợi tất cả socket hoàn thành
     
 
@@ -104,6 +107,16 @@ def read_input_file(file_name):
     finally:
         return file_list
 
+def printProgress(file,isFinish,recv_bytes,chunk_sizes):
+    txt = ""
+    for i in range(4):
+        txt += "Downloading " + file + " part " + str(i+1) + "... " + str(round(recv_bytes[i]/chunk_sizes*100)) + "%\n"
+    print(txt,end = "")
+    if isFinish == True:
+        print("The file "+file+" has been downloaded successfully!")
+        return
+    print('\033[4A',end="")
+
 def init_socket(num):
     sockets = []
     for i in range(num):
@@ -112,6 +125,7 @@ def init_socket(num):
     return sockets
 
 def handling():
+    close_flag = False
     downloaded_files = []
     sockets = init_socket(4)
     input_file = "input.txt"
@@ -120,14 +134,15 @@ def handling():
     print(server_files)
     start = time.time()
     file_list = read_input_file(input_file)
-    while True:
+    received_bytes = [0,0,0,0]
+    while close_flag != True:
         end = time.time()
         if end - start >= 5:
             start = end
             file_list = read_input_file(input_file)
-        global close_flag
         try:
             for file_name in file_list:
+                
                 if server_files.get(file_name) == None:#check xem file co tren server ko, neu khong ti bo qua file do
                     continue
                 if file_name in downloaded_files:
@@ -135,14 +150,13 @@ def handling():
                 print(f"Downloading {file_name}...")
                 chunk_size = server_files[file_name] // num_chunks
                 output_file = os.path.join(os.getcwd(), file_name)
-                print(chunk_size)
                 # Tạo file rỗng
                 with open(output_file, 'wb') as f:
                     f.close()
 
                 threads = []
                 for chunk_id in range(num_chunks):
-                    thread = threading.Thread(target=download_chunk, args=(sockets[chunk_id],file_name, chunk_id, chunk_size, output_file))
+                    thread = threading.Thread(target=download_chunk, args=(sockets[chunk_id],file_name, chunk_id, chunk_size, output_file,received_bytes))
                     threads.append(thread)
                     thread.start()
 
@@ -152,43 +166,13 @@ def handling():
                     thread.join()
                 threads.clear()
 
-                print(f"{file_name} downloaded successfully.")
+                printProgress(file_name,True,received_bytes,chunk_size)
+                received_bytes[:] = [0] * len(received_bytes)
                 downloaded_files.append(file_name)
         except KeyboardInterrupt:
             close_flag = True
             for sock in sockets:
                 sock.close()
 
-def main():
-    downloaded_files = []
-    server_files = getServerFile()
-    num_chunks = 4  # Số phần chia file
-    for file_name in file_list:
-        if server_files.get(file_name) == None:#check xem file co tren server ko, neu khong ti bo qua file do
-            continue
-        if file_name in downloaded_files:
-            continue
-        print(f"Downloading {file_name}...")
-        chunk_size = server_files[file_name] // num_chunks
-        output_file = os.path.join(os.getcwd(), file_name)
-        print(chunk_size)
-        # Tạo file rỗng
-        with open(output_file, 'wb') as f:
-            f.close()
-
-        threads = []
-        for chunk_id in range(num_chunks):
-            thread = threading.Thread(target=download_chunk, args=(file_name, chunk_id, chunk_size, output_file))
-            threads.append(thread)
-            thread.start()
-
-        # Chờ tất cả các thread hoàn thành
-
-        for thread in threads:
-            thread.join()
-        threads.clear()
-
-        print(f"{file_name} downloaded successfully.")
-        downloaded_files.append(file_name)
 if __name__ == "__main__":
     handling()
